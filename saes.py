@@ -41,20 +41,16 @@ def evaluate_c4_ppl(model, tokenizer, seqlen=2048, nsamples=256, batch_size=1):
         data_files={"validation": "en/c4-validation.00000-of-00008.json.gz"},
         split="validation",
     )
-    target_chars = nsamples * seqlen * 6
-    texts = []
-    char_count = 0
+    target_tokens = nsamples * seqlen + 1
+    token_ids = []
     for example in dataset:
         text = example.get("text", "")
         if not text:
             continue
-        texts.append(text)
-        char_count += len(text)
-        if char_count >= target_chars:
+        token_ids.extend(tokenizer.encode(text + "\n\n", add_special_tokens=False))
+        if len(token_ids) >= target_tokens:
             break
-    text = "\n\n".join(texts)
-    enc = tokenizer(text, return_tensors="pt")
-    input_ids = enc.input_ids
+    input_ids = torch.tensor(token_ids[:target_tokens], dtype=torch.long).unsqueeze(0)
     max_chunks = max(0, (input_ids.numel() - 1) // seqlen)
     nsamples = min(nsamples, max_chunks)
     if nsamples <= 0:
@@ -114,8 +110,18 @@ def main(args):
     )
     calib_loader = make_calib_batches(calib_loader, args.calib_batch_size)
 
+    if args.compression_ratio is not None:
+        if args.param_ratio_target is not None:
+            raise ValueError("Use either --compression_ratio or --param_ratio_target, not both")
+        param_ratio = 1.0 - args.compression_ratio
+    else:
+        param_ratio = args.param_ratio_target
+    if not 0.0 < param_ratio <= 1.0:
+        raise ValueError(f"retained parameter ratio must be in (0, 1], got {param_ratio}")
+    print(f"retained_param_ratio={param_ratio:.4f}")
+
     cfg = SAESConfig(
-        param_ratio=args.param_ratio_target,
+        param_ratio=param_ratio,
         damp=args.damp,
         beta_min=args.beta_min,
         beta_max=args.beta_max,
@@ -163,7 +169,18 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_id", type=str, required=True)
-    parser.add_argument("--param_ratio_target", type=float, default=0.2)
+    parser.add_argument(
+        "--param_ratio_target",
+        type=float,
+        default=0.8,
+        help="fraction of Linear parameters to retain after low-rank factorization; 0.2 keeps 20%",
+    )
+    parser.add_argument(
+        "--compression_ratio",
+        type=float,
+        default=None,
+        help="fraction of Linear parameters to remove; 0.2 keeps about 80%",
+    )
     parser.add_argument("--n_calib_samples", type=int, default=128)
     parser.add_argument("--calib_batch_size", type=int, default=1)
     parser.add_argument("--seqlen", type=int, default=2048)

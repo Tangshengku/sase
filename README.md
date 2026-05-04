@@ -22,7 +22,7 @@ pip install -r requirements.txt
 ```bash
 CUDA_VISIBLE_DEVICES=0 python saes.py \
   --model_id Qwen/Qwen3-8B \
-  --param_ratio_target 0.2 \
+  --compression_ratio 0.2 \
   --n_calib_samples 128 \
   --calib_batch_size 4 \
   --seqlen 2048 \
@@ -37,7 +37,7 @@ CUDA_VISIBLE_DEVICES=0 python saes.py \
 ```bash
 CUDA_VISIBLE_DEVICES=0 python saes.py \
   --model_id mistralai/Mistral-7B-v0.1 \
-  --param_ratio_target 0.2 \
+  --compression_ratio 0.2 \
   --n_calib_samples 128 \
   --calib_batch_size 4 \
   --seqlen 2048 \
@@ -50,6 +50,10 @@ CUDA_VISIBLE_DEVICES=0 python saes.py \
 The saved model is exported in dense Hugging Face style: all SAES low-rank
 factors are multiplied back into ordinary `nn.Linear` weights before saving, so
 `lm-eval-harness` can load it as a normal model directory.
+
+`--compression_ratio 0.2` removes about 20% of Linear parameters and keeps about
+80%. If you really want to keep only 20%, use `--param_ratio_target 0.2`
+instead, but that is a much more aggressive setting.
 
 `--eval_c4_ppl` computes a quick C4 validation perplexity on the compressed
 model and writes `eval_c4_ppl.json` into the output directory. Tune runtime with

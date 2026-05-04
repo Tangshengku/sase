@@ -13,6 +13,17 @@ from saes_svd import SAESConfig, compress_model_saes
 from save_utils import save_dense_hf
 
 
+def make_calib_batches(samples, batch_size):
+    if batch_size <= 1:
+        return samples
+    batches = []
+    for start in range(0, len(samples), batch_size):
+        chunk = samples[start : start + batch_size]
+        keys = chunk[0].keys()
+        batches.append({key: torch.cat([sample[key] for sample in chunk], dim=0) for key in keys})
+    return batches
+
+
 def _model_input_device(model):
     try:
         return model.get_input_embeddings().weight.device
@@ -101,6 +112,7 @@ def main(args):
         seed=args.seed,
         use_bos=args.use_bos,
     )
+    calib_loader = make_calib_batches(calib_loader, args.calib_batch_size)
 
     cfg = SAESConfig(
         param_ratio=args.param_ratio_target,
@@ -150,6 +162,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_id", type=str, required=True)
     parser.add_argument("--param_ratio_target", type=float, default=0.2)
     parser.add_argument("--n_calib_samples", type=int, default=128)
+    parser.add_argument("--calib_batch_size", type=int, default=1)
     parser.add_argument("--seqlen", type=int, default=2048)
     parser.add_argument(
         "--calib_dataset",

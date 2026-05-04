@@ -24,6 +24,7 @@ CUDA_VISIBLE_DEVICES=0 python saes.py \
   --model_id Qwen/Qwen3-8B \
   --param_ratio_target 0.2 \
   --n_calib_samples 128 \
+  --calib_batch_size 4 \
   --seqlen 2048 \
   --calib_dataset mix:wikitext2,evol-codealpaca,tulu-math \
   --eval_c4_ppl \
@@ -38,6 +39,7 @@ CUDA_VISIBLE_DEVICES=0 python saes.py \
   --model_id mistralai/Mistral-7B-v0.1 \
   --param_ratio_target 0.2 \
   --n_calib_samples 128 \
+  --calib_batch_size 4 \
   --seqlen 2048 \
   --calib_dataset mix:wikitext2,evol-codealpaca,tulu-math \
   --eval_c4_ppl \

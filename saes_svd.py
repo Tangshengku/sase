@@ -17,8 +17,11 @@ class SAESConfig:
     beta_max: float = 0.99
     beta_cap: float = 0.95
     beta_shrink: float = 1.0
+    fixed_beta: float = None
     beta_objective: str = "ratio"
     rank_align: int = 1
+    svd_oversample: int = 32
+    svd_niter: int = 4
     include_names: tuple = ()
     exclude_names: tuple = ("lm_head",)
 
@@ -95,34 +98,45 @@ def _rank_for_linear(linear, param_ratio, rank_align):
     return rank
 
 
-def _inv_sqrt_from_cov(h, damp):
+def _regularized_cov(h, damp):
     h = torch.nan_to_num(h.float(), nan=0.0, posinf=0.0, neginf=0.0)
     h = 0.5 * (h + h.t())
     diag_mean = torch.diag(h).mean().clamp(min=1e-6)
     ridge = damp * diag_mean
     eye = torch.eye(h.shape[0], device=h.device, dtype=h.dtype)
+    return h + ridge * eye
+
+
+def _inv_sqrt_from_cov(h, damp):
+    h_reg = _regularized_cov(h, damp)
+    ridge = torch.diag(h_reg).mean().clamp(min=1e-6) * 1e-6
     for attempt in range(8):
         try:
-            evals, evecs = torch.linalg.eigh(h + ridge * eye)
-            floor = max(float(ridge.item()) * 1e-3, 1e-8)
+            evals, evecs = torch.linalg.eigh(h_reg)
+            floor = max(float(ridge.item()), 1e-8)
             evals = evals.clamp(min=floor).rsqrt()
             inv_sqrt = evecs @ torch.diag(evals) @ evecs.t()
             inv_sqrt = torch.nan_to_num(inv_sqrt, nan=0.0, posinf=0.0, neginf=0.0)
             return 0.5 * (inv_sqrt + inv_sqrt.t())
         except RuntimeError:
+            eye = torch.eye(h_reg.shape[0], device=h_reg.device, dtype=h_reg.dtype)
+            h_reg = h_reg + ridge * eye
             ridge = ridge * 10.0
             if h.is_cuda and attempt >= 3:
                 torch.cuda.empty_cache()
-    evals, evecs = torch.linalg.eigh((h + ridge * eye).cpu())
+    evals, evecs = torch.linalg.eigh(h_reg.cpu())
     floor = max(float(ridge.cpu().item()) * 1e-3, 1e-8)
     evals = evals.clamp(min=floor).rsqrt()
     return (evecs @ torch.diag(evals) @ evecs.t()).to(h.device)
 
 
-def _svd_lowrank(matrix, rank):
+def _svd_lowrank(matrix, rank, oversample=32, niter=4):
     matrix = torch.nan_to_num(matrix.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    max_rank = min(matrix.shape)
+    q = max(1, min(rank + oversample, max_rank))
     try:
-        return torch.svd_lowrank(matrix, q=rank)
+        u, s, v = torch.svd_lowrank(matrix, q=q, niter=niter)
+        return u[:, :rank], s[:rank], v[:, :rank]
     except RuntimeError:
         u, s, vh = torch.linalg.svd(matrix.cpu(), full_matrices=False)
         return u[:, :rank].to(matrix.device), s[:rank].to(matrix.device), vh[:rank, :].t().to(matrix.device)
@@ -139,8 +153,9 @@ def _inner(x, y):
 @torch.no_grad()
 def aces_beta_select(weight, h, delta, rank, damp, beta_min, beta_max, beta_cap, beta_shrink, objective):
     lmat = _inv_sqrt_from_cov(h, damp)
+    h_reg = _regularized_cov(h, damp)
     w = weight.float()
-    s_mat = (w @ h) @ lmat
+    s_mat = (w @ h_reg) @ lmat
     d_mat = (w @ delta) @ lmat
     u, _, v = _svd_lowrank(s_mat, rank)
 
@@ -194,24 +209,28 @@ def saes_decompose_linear(linear, stat, cfg):
     h = stat.h.to(device)
     delta = stat.delta.to(device)
     lmat = _inv_sqrt_from_cov(h, cfg.damp)
-    beta = aces_beta_select(
-        linear.weight.data,
-        h,
-        delta,
-        rank,
-        cfg.damp,
-        cfg.beta_min,
-        cfg.beta_max,
-        cfg.beta_cap,
-        cfg.beta_shrink,
-        cfg.beta_objective,
-    )
-    target = (linear.weight.data.float() @ (h + beta * delta)) @ lmat
-    u, s, v = _svd_lowrank(target, rank)
+    h_reg = _regularized_cov(h, cfg.damp)
+    if cfg.fixed_beta is None:
+        beta = aces_beta_select(
+            linear.weight.data,
+            h,
+            delta,
+            rank,
+            cfg.damp,
+            cfg.beta_min,
+            cfg.beta_max,
+            cfg.beta_cap,
+            cfg.beta_shrink,
+            cfg.beta_objective,
+        )
+    else:
+        beta = max(cfg.beta_min, min(float(cfg.fixed_beta), min(cfg.beta_max, cfg.beta_cap)))
+    target = (linear.weight.data.float() @ (h_reg + beta * delta)) @ lmat
+    u, s, v = _svd_lowrank(target, rank, cfg.svd_oversample, cfg.svd_niter)
     if not (torch.isfinite(u).all() and torch.isfinite(s).all() and torch.isfinite(v).all()):
         beta = 0.0
-        target = (linear.weight.data.float() @ h) @ lmat
-        u, s, v = _svd_lowrank(target, rank)
+        target = (linear.weight.data.float() @ h_reg) @ lmat
+        u, s, v = _svd_lowrank(target, rank, cfg.svd_oversample, cfg.svd_niter)
     s_sqrt = s.clamp(min=0).sqrt()
     a_weight = u.mul(s_sqrt.view(1, -1)).to(dtype=linear.weight.dtype)
     b_weight = (v.t().mul(s_sqrt.view(-1, 1)) @ lmat).to(dtype=linear.weight.dtype)
@@ -227,37 +246,42 @@ def _set_child(module, dotted_name, child):
     setattr(parent, parts[-1], child)
 
 
+def _get_child(module, dotted_name):
+    child = module
+    for part in dotted_name.split("."):
+        child = getattr(child, part)
+    return child
+
+
 @torch.no_grad()
-def collect_layer_stats(model, fp_model, layer_idx, calib_loader, cfg, fp_model_device):
+def collect_linear_stats(model, fp_model, layer_idx, linear_name, calib_loader, fp_model_device):
     layer = get_decoder_layers(model)[layer_idx]
     fp_layer = get_decoder_layers(fp_model)[layer_idx]
-    device = _module_device(layer)
+    linear = _get_child(layer, linear_name)
+    device = linear.weight.device
     model_input_device = _model_input_device(model)
     fp_input_device = torch.device(fp_model_device) if fp_model_device != "same" else _model_input_device(fp_model)
-    current_inputs = {}
-    fp_inputs = {}
-    stats = {}
+    current_input = {}
+    fp_input = {}
     handles = []
 
-    for name, linear in iter_target_linears(layer, cfg.include_names, cfg.exclude_names):
-        stats[name] = SecondOrderStat(linear.in_features, device)
-        handles.append(linear.register_forward_pre_hook(lambda mod, inp, key=name: current_inputs.__setitem__(key, inp[0].detach())))
-    for name, linear in iter_target_linears(fp_layer, cfg.include_names, cfg.exclude_names):
-        handles.append(linear.register_forward_pre_hook(lambda mod, inp, key=name: fp_inputs.__setitem__(key, inp[0].detach())))
+    fp_linear = _get_child(fp_layer, linear_name)
+    stat = SecondOrderStat(linear.in_features, device)
+    handles.append(linear.register_forward_pre_hook(lambda mod, inp: current_input.__setitem__("x", inp[0].detach())))
+    handles.append(fp_linear.register_forward_pre_hook(lambda mod, inp: fp_input.__setitem__("x", inp[0].detach())))
 
     try:
         for batch in calib_loader:
-            current_inputs.clear()
-            fp_inputs.clear()
+            current_input.clear()
+            fp_input.clear()
             current_out = _forward_for_hooks(model, _batch_to_device(batch, model_input_device))
             fp_out = _forward_for_hooks(fp_model, _batch_to_device(batch, fp_input_device))
             del current_out, fp_out
-            for name, stat in stats.items():
-                stat.update(current_inputs[name], fp_inputs[name])
+            stat.update(current_input["x"], fp_input["x"])
     finally:
         for handle in handles:
             handle.remove()
-    return stats
+    return stat
 
 
 @torch.no_grad()
@@ -268,9 +292,11 @@ def compress_model_saes(model, fp_model, calib_loader, cfg, fp_model_device="sam
     beta_log = {}
     for layer_idx in tqdm(range(len(layers)), desc="SAES-SVD layers"):
         layer = layers[layer_idx]
-        stats = collect_layer_stats(model, fp_model, layer_idx, calib_loader, cfg, fp_model_device)
-        for name, linear in list(iter_target_linears(layer, cfg.include_names, cfg.exclude_names)):
-            svd_linear, beta = saes_decompose_linear(linear, stats[name], cfg)
+        linear_names = [name for name, _ in iter_target_linears(layer, cfg.include_names, cfg.exclude_names)]
+        for name in tqdm(linear_names, desc=f"layer {layer_idx} linears", leave=False):
+            linear = _get_child(layer, name)
+            stat = collect_linear_stats(model, fp_model, layer_idx, name, calib_loader, fp_model_device)
+            svd_linear, beta = saes_decompose_linear(linear, stat, cfg)
             _set_child(layer, name, svd_linear)
             beta_log[f"model.layers.{layer_idx}.{name}"] = beta
             if linear.weight.is_cuda:

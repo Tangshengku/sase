@@ -121,8 +121,11 @@ def main(args):
         beta_max=args.beta_max,
         beta_cap=args.beta_cap,
         beta_shrink=args.beta_shrink,
+        fixed_beta=args.fixed_beta,
         beta_objective=args.beta_objective,
         rank_align=args.rank_align,
+        svd_oversample=args.svd_oversample,
+        svd_niter=args.svd_niter,
         include_names=tuple(args.include_names.split(",")) if args.include_names else (),
         exclude_names=tuple(args.exclude_names.split(",")) if args.exclude_names else (),
     )
@@ -182,8 +185,11 @@ if __name__ == "__main__":
     parser.add_argument("--beta_max", type=float, default=0.99)
     parser.add_argument("--beta_cap", type=float, default=0.95)
     parser.add_argument("--beta_shrink", type=float, default=1.0)
+    parser.add_argument("--fixed_beta", type=float, default=None, help="disable ACES and use a fixed beta, e.g. 0.0")
     parser.add_argument("--beta_objective", type=str, default="ratio", choices=["ratio", "energy"])
     parser.add_argument("--rank_align", type=int, default=1)
+    parser.add_argument("--svd_oversample", type=int, default=32)
+    parser.add_argument("--svd_niter", type=int, default=4)
     parser.add_argument("--eval_c4_ppl", action="store_true", help="compute quick C4 validation perplexity after compression")
     parser.add_argument("--eval_c4_samples", type=int, default=256)
     parser.add_argument("--eval_c4_seqlen", type=int, default=2048)

@@ -97,19 +97,26 @@ def _rank_for_linear(linear, param_ratio, rank_align):
 
 def _inv_sqrt_from_cov(h, damp):
     h = torch.nan_to_num(h.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    h = 0.5 * (h + h.t())
     diag_mean = torch.diag(h).mean().clamp(min=1e-6)
     ridge = damp * diag_mean
     eye = torch.eye(h.shape[0], device=h.device, dtype=h.dtype)
-    for _ in range(8):
+    for attempt in range(8):
         try:
-            chol = torch.linalg.cholesky(h + ridge * eye)
-            inv = torch.cholesky_inverse(chol)
-            return torch.linalg.cholesky(inv)
+            evals, evecs = torch.linalg.eigh(h + ridge * eye)
+            floor = max(float(ridge.item()) * 1e-3, 1e-8)
+            evals = evals.clamp(min=floor).rsqrt()
+            inv_sqrt = evecs @ torch.diag(evals) @ evecs.t()
+            inv_sqrt = torch.nan_to_num(inv_sqrt, nan=0.0, posinf=0.0, neginf=0.0)
+            return 0.5 * (inv_sqrt + inv_sqrt.t())
         except RuntimeError:
             ridge = ridge * 10.0
-    evals, evecs = torch.linalg.eigh(h + ridge * eye)
-    evals = evals.clamp(min=1e-8).rsqrt()
-    return evecs @ torch.diag(evals) @ evecs.t()
+            if h.is_cuda and attempt >= 3:
+                torch.cuda.empty_cache()
+    evals, evecs = torch.linalg.eigh((h + ridge * eye).cpu())
+    floor = max(float(ridge.cpu().item()) * 1e-3, 1e-8)
+    evals = evals.clamp(min=floor).rsqrt()
+    return (evecs @ torch.diag(evals) @ evecs.t()).to(h.device)
 
 
 def _svd_lowrank(matrix, rank):
@@ -173,7 +180,10 @@ def aces_beta_select(weight, h, delta, rank, damp, beta_min, beta_max, beta_cap,
         value = (a + 2.0 * b * beta + c * beta * beta) / max(denom, 1e-12)
         return value, beta
 
-    _, beta = min(score(beta) for beta in candidates if math.isfinite(beta))
+    finite_scores = [score(beta) for beta in candidates if math.isfinite(beta)]
+    if not finite_scores:
+        return 0.0
+    _, beta = min(finite_scores)
     return float(max(beta_min, min(beta, min(beta_max, beta_cap))))
 
 
@@ -198,6 +208,10 @@ def saes_decompose_linear(linear, stat, cfg):
     )
     target = (linear.weight.data.float() @ (h + beta * delta)) @ lmat
     u, s, v = _svd_lowrank(target, rank)
+    if not (torch.isfinite(u).all() and torch.isfinite(s).all() and torch.isfinite(v).all()):
+        beta = 0.0
+        target = (linear.weight.data.float() @ h) @ lmat
+        u, s, v = _svd_lowrank(target, rank)
     s_sqrt = s.clamp(min=0).sqrt()
     a_weight = u.mul(s_sqrt.view(1, -1)).to(dtype=linear.weight.dtype)
     b_weight = (v.t().mul(s_sqrt.view(-1, 1)) @ lmat).to(dtype=linear.weight.dtype)

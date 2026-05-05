@@ -132,10 +132,20 @@ def main(args):
         rank_align=args.rank_align,
         svd_oversample=args.svd_oversample,
         svd_niter=args.svd_niter,
+        svd_method=args.svd_method,
+        decomposition=args.decomposition,
         include_names=tuple(args.include_names.split(",")) if args.include_names else (),
         exclude_names=tuple(args.exclude_names.split(",")) if args.exclude_names else (),
     )
     beta_log = compress_model_saes(model, fp_model, calib_loader, cfg, fp_model_device=args.fp_model_device)
+    if beta_log:
+        beta_values = torch.tensor(list(beta_log.values()), dtype=torch.float32)
+        print(
+            "beta_summary="
+            f"min:{beta_values.min().item():.4f},"
+            f"mean:{beta_values.mean().item():.4f},"
+            f"max:{beta_values.max().item():.4f}"
+        )
 
     c4_ppl = None
     if args.eval_c4_ppl:
@@ -200,13 +210,15 @@ if __name__ == "__main__":
     parser.add_argument("--damp", type=float, default=0.01)
     parser.add_argument("--beta_min", type=float, default=0.0)
     parser.add_argument("--beta_max", type=float, default=0.99)
-    parser.add_argument("--beta_cap", type=float, default=0.95)
+    parser.add_argument("--beta_cap", type=float, default=0.5)
     parser.add_argument("--beta_shrink", type=float, default=1.0)
     parser.add_argument("--fixed_beta", type=float, default=None, help="disable ACES and use a fixed beta, e.g. 0.0")
     parser.add_argument("--beta_objective", type=str, default="ratio", choices=["ratio", "energy"])
     parser.add_argument("--rank_align", type=int, default=1)
     parser.add_argument("--svd_oversample", type=int, default=32)
     parser.add_argument("--svd_niter", type=int, default=4)
+    parser.add_argument("--svd_method", type=str, default="exact", choices=["exact", "randomized"])
+    parser.add_argument("--decomposition", type=str, default="saes", choices=["vanilla", "asvd", "saes"])
     parser.add_argument("--eval_c4_ppl", action="store_true", help="compute quick C4 validation perplexity after compression")
     parser.add_argument("--eval_c4_samples", type=int, default=256)
     parser.add_argument("--eval_c4_seqlen", type=int, default=2048)

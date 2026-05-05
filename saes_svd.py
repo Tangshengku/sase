@@ -15,13 +15,15 @@ class SAESConfig:
     damp: float = 0.01
     beta_min: float = 0.0
     beta_max: float = 0.99
-    beta_cap: float = 0.95
+    beta_cap: float = 0.5
     beta_shrink: float = 1.0
     fixed_beta: float = None
     beta_objective: str = "ratio"
     rank_align: int = 1
     svd_oversample: int = 32
     svd_niter: int = 4
+    svd_method: str = "exact"
+    decomposition: str = "saes"
     include_names: tuple = ()
     exclude_names: tuple = ("lm_head",)
 
@@ -33,11 +35,18 @@ class SecondOrderStat:
         self.n = 0
 
     @torch.no_grad()
-    def update(self, x, x_fp):
+    def update(self, x, x_fp, attention_mask=None):
         x = _flatten_activation(x).to(device=self.h.device, dtype=torch.float32)
         x_fp = _flatten_activation(x_fp).to(device=self.h.device, dtype=torch.float32)
         if x.shape != x_fp.shape:
             raise ValueError(f"activation shape mismatch: {x.shape} vs {x_fp.shape}")
+        if attention_mask is not None:
+            mask = attention_mask.reshape(-1).to(device=x.device).bool()
+            if mask.numel() == x.shape[0]:
+                x = x[mask]
+                x_fp = x_fp[mask]
+        if x.numel() == 0:
+            return
         x = x.t().contiguous()
         x_fp = x_fp.t().contiguous()
         m = x.shape[1]
@@ -130,9 +139,12 @@ def _inv_sqrt_from_cov(h, damp):
     return (evecs @ torch.diag(evals) @ evecs.t()).to(h.device)
 
 
-def _svd_lowrank(matrix, rank, oversample=32, niter=4):
+def _svd_lowrank(matrix, rank, oversample=32, niter=4, method="exact"):
     matrix = torch.nan_to_num(matrix.float(), nan=0.0, posinf=0.0, neginf=0.0)
     max_rank = min(matrix.shape)
+    if method == "exact":
+        u, s, vh = torch.linalg.svd(matrix.cpu(), full_matrices=False)
+        return u[:, :rank].to(matrix.device), s[:rank].to(matrix.device), vh[:rank, :].t().to(matrix.device)
     q = max(1, min(rank + oversample, max_rank))
     try:
         u, s, v = torch.svd_lowrank(matrix, q=q, niter=niter)
@@ -208,32 +220,48 @@ def saes_decompose_linear(linear, stat, cfg):
     device = linear.weight.device
     h = stat.h.to(device)
     delta = stat.delta.to(device)
-    lmat = _inv_sqrt_from_cov(h, cfg.damp)
-    h_reg = _regularized_cov(h, cfg.damp)
-    if cfg.fixed_beta is None:
-        beta = aces_beta_select(
-            linear.weight.data,
-            h,
-            delta,
-            rank,
-            cfg.damp,
-            cfg.beta_min,
-            cfg.beta_max,
-            cfg.beta_cap,
-            cfg.beta_shrink,
-            cfg.beta_objective,
-        )
+    if cfg.decomposition == "vanilla":
+        beta = 0.0
+        target = linear.weight.data.float()
+        right = None
     else:
-        beta = max(cfg.beta_min, min(float(cfg.fixed_beta), min(cfg.beta_max, cfg.beta_cap)))
-    target = (linear.weight.data.float() @ (h_reg + beta * delta)) @ lmat
-    u, s, v = _svd_lowrank(target, rank, cfg.svd_oversample, cfg.svd_niter)
+        lmat = _inv_sqrt_from_cov(h, cfg.damp)
+        h_reg = _regularized_cov(h, cfg.damp)
+        if cfg.decomposition == "asvd":
+            beta = 0.0
+        elif cfg.fixed_beta is None:
+            beta = aces_beta_select(
+                linear.weight.data,
+                h,
+                delta,
+                rank,
+                cfg.damp,
+                cfg.beta_min,
+                cfg.beta_max,
+                cfg.beta_cap,
+                cfg.beta_shrink,
+                cfg.beta_objective,
+            )
+        else:
+            beta = max(cfg.beta_min, min(float(cfg.fixed_beta), min(cfg.beta_max, cfg.beta_cap)))
+        target = (linear.weight.data.float() @ (h_reg + beta * delta)) @ lmat
+        right = lmat
+    u, s, v = _svd_lowrank(target, rank, cfg.svd_oversample, cfg.svd_niter, cfg.svd_method)
     if not (torch.isfinite(u).all() and torch.isfinite(s).all() and torch.isfinite(v).all()):
         beta = 0.0
-        target = (linear.weight.data.float() @ h_reg) @ lmat
-        u, s, v = _svd_lowrank(target, rank, cfg.svd_oversample, cfg.svd_niter)
+        if cfg.decomposition == "vanilla":
+            target = linear.weight.data.float()
+            right = None
+        else:
+            target = (linear.weight.data.float() @ h_reg) @ lmat
+            right = lmat
+        u, s, v = _svd_lowrank(target, rank, cfg.svd_oversample, cfg.svd_niter, cfg.svd_method)
     s_sqrt = s.clamp(min=0).sqrt()
     a_weight = u.mul(s_sqrt.view(1, -1)).to(dtype=linear.weight.dtype)
-    b_weight = (v.t().mul(s_sqrt.view(-1, 1)) @ lmat).to(dtype=linear.weight.dtype)
+    b_weight = v.t().mul(s_sqrt.view(-1, 1))
+    if right is not None:
+        b_weight = b_weight @ right
+    b_weight = b_weight.to(dtype=linear.weight.dtype)
     bias = linear.bias.data.detach().clone() if linear.bias is not None else None
     return SAESSVDLinear(a_weight, b_weight, bias).to(device=device, dtype=linear.weight.dtype), beta
 
@@ -277,7 +305,7 @@ def collect_linear_stats(model, fp_model, layer_idx, linear_name, calib_loader, 
             current_out = _forward_for_hooks(model, _batch_to_device(batch, model_input_device))
             fp_out = _forward_for_hooks(fp_model, _batch_to_device(batch, fp_input_device))
             del current_out, fp_out
-            stat.update(current_input["x"], fp_input["x"])
+            stat.update(current_input["x"], fp_input["x"], batch.get("attention_mask"))
     finally:
         for handle in handles:
             handle.remove()

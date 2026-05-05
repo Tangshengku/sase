@@ -55,6 +55,10 @@ factors are multiplied back into ordinary `nn.Linear` weights before saving, so
 80%. If you really want to keep only 20%, use `--param_ratio_target 0.2`
 instead, but that is a much more aggressive setting.
 
+For debugging compression quality, run the same command with
+`--decomposition vanilla`, then `--decomposition asvd`, then the default
+`--decomposition saes`. If vanilla is already bad, the issue is not ACES.
+
 `--eval_c4_ppl` computes a quick C4 validation perplexity on the compressed
 model and writes `eval_c4_ppl.json` into the output directory. Tune runtime with
 `--eval_c4_samples`, `--eval_c4_seqlen`, and `--eval_c4_batch_size`.
